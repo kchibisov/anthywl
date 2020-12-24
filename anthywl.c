@@ -14,8 +14,8 @@
 
 #include <anthy/anthy.h>
 #include <cairo.h>
-#include <pango/pangocairo.h>
 #include <pango/pango.h>
+#include <pango/pangocairo.h>
 #include <wayland-client.h>
 #include <xkbcommon/xkbcommon.h>
 
@@ -54,6 +54,7 @@ struct anthywl_seat {
     struct zwp_input_method_keyboard_grab_v2 *zwp_input_method_keyboard_grab_v2;
     struct zwp_virtual_keyboard_v1 *zwp_virtual_keyboard_v1;
 
+    char *xkb_keymap_string;
     struct xkb_context *xkb_context;
     struct xkb_keymap *xkb_keymap;
     struct xkb_state *xkb_state;
@@ -87,7 +88,7 @@ struct anthywl_seat {
     int current_segment;
     int segment_count;
     int *selected_candidates;
-    struct anthy_context *anthy_context;
+    anthy_context_t anthy_context;
 
     // popup
     struct wl_surface *wl_surface;
@@ -116,33 +117,33 @@ static struct anthywl_graphics_buffer *anthywl_seat_composing_draw_popup(
     cairo_surface_t *recording_cairo_surface =
         cairo_recording_surface_create(CAIRO_CONTENT_COLOR_ALPHA, NULL);
     cairo_t *recording_cairo = cairo_create(recording_cairo_surface);
-
     PangoLayout *layout = pango_cairo_create_layout(recording_cairo);
 
-    double x = BORDER + PADDING, y = BORDER + PADDING, max_x = 0;
+    double x = BORDER + PADDING, y = BORDER + PADDING;
+    double max_text_width = 0.0;
     cairo_move_to(recording_cairo, x, y);
 
-    {
-        pango_layout_set_text(layout, seat->buffer.text, -1);
-        PangoRectangle rect;
-        pango_layout_get_extents(layout, NULL, &rect);
-        max_x = (double)rect.width / PANGO_SCALE > max_x
-            ? (double)rect.width / PANGO_SCALE
-            : max_x;
-        y += (double)rect.height / PANGO_SCALE;
-        cairo_set_source_rgba(recording_cairo, 1.0, 1.0, 1.0, 1.0);
-        pango_cairo_update_layout(recording_cairo, layout);
-        pango_cairo_show_layout(recording_cairo, layout);
-        cairo_move_to(recording_cairo, x, y);
+    pango_layout_set_text(layout, seat->buffer.text, -1);
+    PangoRectangle rect;
+    pango_layout_get_extents(layout, NULL, &rect);
+    double text_width = (double)rect.width / PANGO_SCALE;
+    double text_height = (double)rect.height / PANGO_SCALE;
+    if (text_width > max_text_width) {
+        max_text_width = text_width;
     }
+    y += text_height;
+    cairo_set_source_rgba(recording_cairo, 1.0, 1.0, 1.0, 1.0);
+    pango_cairo_update_layout(recording_cairo, layout);
+    pango_cairo_show_layout(recording_cairo, layout);
+    cairo_move_to(recording_cairo, x, y);
 
-    max_x += BORDER * 2.0 + PADDING * 2.0;
+    x = max_text_width + BORDER * 2.0 + PADDING * 2.0;
     y += BORDER + PADDING;
 
     double half_border = BORDER / 2.0;
     cairo_move_to(recording_cairo, half_border, half_border);
-    cairo_line_to(recording_cairo, max_x - half_border, half_border);
-    cairo_line_to(recording_cairo, max_x - half_border, y - half_border);
+    cairo_line_to(recording_cairo, x - half_border, half_border);
+    cairo_line_to(recording_cairo, x - half_border, y - half_border);
     cairo_line_to(recording_cairo, half_border, y - half_border);
     cairo_line_to(recording_cairo, half_border, half_border);
     cairo_set_line_width(recording_cairo, BORDER);
@@ -170,7 +171,6 @@ static struct anthywl_graphics_buffer *anthywl_seat_selecting_draw_popup(
     cairo_surface_t *recording_cairo_surface =
         cairo_recording_surface_create(CAIRO_CONTENT_COLOR_ALPHA, NULL);
     cairo_t *recording_cairo = cairo_create(recording_cairo_surface);
-
     PangoLayout *layout = pango_cairo_create_layout(recording_cairo);
 
     double x = BORDER + PADDING, y = BORDER + PADDING;
@@ -352,6 +352,7 @@ static void anthywl_seat_destroy(struct anthywl_seat *seat) {
     xkb_state_unref(seat->xkb_state);
     xkb_keymap_unref(seat->xkb_keymap);
     xkb_context_unref(seat->xkb_context);
+    free(seat->xkb_keymap_string);
     if (seat->are_protocols_initted) {
         zwp_input_popup_surface_v2_destroy(seat->zwp_input_popup_surface_v2);
         wl_surface_destroy(seat->wl_surface);
@@ -632,6 +633,7 @@ static bool anthywl_seat_selecting_handle_key_event(
         return true;
     default:
         anthywl_seat_selecting_commit(seat);
+        // FIXME: this key should be handled by the IME again after this
         return false;
     }
 }
@@ -640,23 +642,25 @@ static bool anthywl_seat_handle_key(struct anthywl_seat *seat,
     xkb_keycode_t keycode)
 {
     xkb_keysym_t keysym = xkb_state_key_get_one_sym(seat->xkb_state, keycode);
-    if (seat->is_selecting) {
+    if (seat->is_selecting)
         return anthywl_seat_selecting_handle_key_event(seat, keycode);
-    } else if (seat->is_composing) {
+    if (seat->is_composing)
         return anthywl_seat_composing_handle_key_event(seat, keycode);
-    } else if (keysym == XKB_KEY_Super_R) {
+    if (keysym == XKB_KEY_Super_R)
         seat->is_composing = true;
-        return true;
-    }
     return false;
 }
 
 static void anthywl_seat_repeat_timer_callback(struct anthywl_timer *timer) {
     struct anthywl_seat *seat = wl_container_of(timer, seat, repeat_timer);
-    clock_gettime(CLOCK_MONOTONIC, &seat->repeat_timer.time);
-    seat->repeat_timer.time.tv_nsec += 1000000000 / seat->repeat_rate;
-    seat->repeat_timer.callback = anthywl_seat_repeat_timer_callback;
-    anthywl_seat_handle_key(seat, seat->repeating_keycode);
+    if (!anthywl_seat_handle_key(seat, seat->repeating_keycode)) {
+        wl_list_remove(&timer->link);
+        seat->repeating_keycode = 0;
+    } else {
+        clock_gettime(CLOCK_MONOTONIC, &seat->repeat_timer.time);
+        timer->time.tv_nsec += 1000000000 / seat->repeat_rate;
+        timer->callback = anthywl_seat_repeat_timer_callback;
+    }
 }
 
 static void zwp_input_method_keyboard_grab_v2_keymap(void *data,
@@ -664,16 +668,20 @@ static void zwp_input_method_keyboard_grab_v2_keymap(void *data,
     uint32_t format, int32_t fd, uint32_t size)
 {
     struct anthywl_seat *seat = data;
-    zwp_virtual_keyboard_v1_keymap(
-        seat->zwp_virtual_keyboard_v1, format, fd, size);
-
     char *map = mmap(NULL, size, PROT_READ, MAP_PRIVATE, fd, 0);
-    xkb_keymap_unref(seat->xkb_keymap);
-    xkb_state_unref(seat->xkb_state);
-    seat->xkb_keymap = xkb_keymap_new_from_string(seat->xkb_context, map,
-        XKB_KEYMAP_FORMAT_TEXT_V1, XKB_KEYMAP_COMPILE_NO_FLAGS);
-    seat->xkb_state = xkb_state_new(seat->xkb_keymap);
-
+    if (seat->xkb_keymap_string == NULL
+        || strcmp(seat->xkb_keymap_string, map) != 0)
+    {
+        zwp_virtual_keyboard_v1_keymap(
+            seat->zwp_virtual_keyboard_v1, format, fd, size);
+        xkb_keymap_unref(seat->xkb_keymap);
+        xkb_state_unref(seat->xkb_state);
+        seat->xkb_keymap = xkb_keymap_new_from_string(seat->xkb_context, map,
+            XKB_KEYMAP_FORMAT_TEXT_V1, XKB_KEYMAP_COMPILE_NO_FLAGS);
+        seat->xkb_state = xkb_state_new(seat->xkb_keymap);
+        free(seat->xkb_keymap_string);
+        seat->xkb_keymap_string = strdup(map);
+    }
     close(fd);
     munmap(map, size);
 }
@@ -1003,7 +1011,8 @@ static bool anthywl_state_init(struct anthywl_state *state) {
         struct wl_proxy **location =
             (struct wl_proxy **)((uintptr_t)state + global->offset);
         if (*location == NULL) {
-            fprintf(stderr, "required interface unsupported by compositor: %s\n",
+            fprintf(
+                stderr, "required interface unsupported by compositor: %s\n",
                 global->name);
             return false;
         }
